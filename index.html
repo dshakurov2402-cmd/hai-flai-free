@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HALF-LIFE: Web Edition</title>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Share Tech Mono', monospace; }
+        #root { width: 100%; height: 100%; }
+        
+        /* CRT Scanlines Overlay */
+        .crt::before {
+            content: " ";
+            display: block;
+            position: absolute;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            z-index: 10;
+            background-size: 100% 4px, 3px 100%;
+            pointer-events: none;
+        }
+
+        .hl-orange { color: #ffb000; }
+        .hl-bg-orange { background-color: #ffb000; }
+        .lambda-font { font-family: serif; font-weight: bold; }
+
+        @keyframes pulse {
+            0% { opacity: 0.4; }
+            50% { opacity: 0.7; }
+            100% { opacity: 0.4; }
+        }
+        .animate-pulse-slow { animation: pulse 4s infinite ease-in-out; }
+    </style>
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "three": "https://esm.sh/three@0.160.0",
+        "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.14",
+        "@react-three/drei": "https://esm.sh/@react-three/drei@9.96.1"
+      }
+    }
+    </script>
+</head>
+<body class="crt">
+    <div id="root"></div>
+
+    <script type="module">
+        import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import * as THREE from 'three';
+        import { Canvas, useFrame, useThree } from '@react-three/fiber';
+        import { PointerLockControls, PerspectiveCamera, Stars } from '@react-three/drei';
+
+        const HL_ORANGE = '#ffb000';
+
+        // --- 1. PROCEDURAL TEXTURE GENERATOR ---
+        const generateTexture = (type) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+
+            const addNoise = (color, factor) => {
+                for (let i = 0; i < canvas.width; i += 2) {
+                    for (let j = 0; j < canvas.height; j += 2) {
+                        const n = (Math.random() - 0.5) * factor;
+                        ctx.fillStyle = `rgb(${color.r + n},${color.g + n},${color.b + n})`;
+                        ctx.fillRect(i, j, 2, 2);
+                    }
+                }
+            };
+
+            switch (type) {
+                case 'concrete':
+                    addNoise({ r: 100, g: 100, b: 100 }, 30);
+                    break;
+                case 'metal':
+                    ctx.fillStyle = '#444';
+                    ctx.fillRect(0, 0, 128, 128);
+                    addNoise({ r: 70, g: 75, b: 85 }, 20);
+                    ctx.strokeStyle = '#222';
+                    ctx.strokeRect(5, 5, 118, 118);
+                    break;
+                case 'hazard':
+                    ctx.fillStyle = '#111';
+                    ctx.fillRect(0, 0, 128, 128);
+                    ctx.fillStyle = '#ccaa00';
+                    for (let i = -128; i < 128; i += 32) {
+                        ctx.beginPath();
+                        ctx.moveTo(i, 0); ctx.lineTo(i + 16, 0);
+                        ctx.lineTo(i + 144, 128); ctx.lineTo(i + 128, 128);
+                        ctx.fill();
+                    }
+                    break;
+                case 'labwall':
+                    ctx.fillStyle = '#555';
+                    ctx.fillRect(0,0,128,128);
+                    addNoise({r:80, g:80, b:75}, 15);
+                    ctx.fillStyle = '#333';
+                    ctx.fillRect(0, 60, 128, 4);
+                    break;
+                case 'corridor_wall':
+                    ctx.fillStyle = '#eee';
+                    ctx.fillRect(0, 0, 128, 64);
+                    ctx.fillStyle = '#4a5d4a';
+                    ctx.fillRect(0, 64, 128, 64);
+                    ctx.fillStyle = '#222';
+                    ctx.fillRect(0, 120, 128, 8);
+                    break;
+                case 'skin_alien':
+                    addNoise({ r: 180, g: 160, b: 100 }, 40);
+                    break;
+            }
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.magFilter = THREE.NearestFilter;
+            tex.minFilter = THREE.NearestFilter;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            return tex;
+        };
+
+        const GlobalTextures = {
+            concrete: generateTexture('concrete'),
+            metal: generateTexture('metal'),
+            hazard: generateTexture('hazard'),
+            labwall: generateTexture('labwall'),
+            corridor: generateTexture('corridor_wall'),
+            skin: generateTexture('skin_alien')
+        };
+
+        // --- 2. GAME COMPONENTS ---
+
+        const Weapon = ({ isAttacking }) => {
+            const mesh = useRef();
+            const [pos, setPos] = useState([0.5, -0.4, -0.5]);
+
+            useFrame((state) => {
+                const t = state.clock.getElapsedTime();
+                // Sway logic
+                mesh.current.position.x = THREE.MathUtils.lerp(mesh.current.position.x, 0.5 + Math.sin(t * 2) * 0.01, 0.1);
+                mesh.current.position.y = THREE.MathUtils.lerp(mesh.current.position.y, -0.4 + Math.cos(t * 4) * 0.01, 0.1);
+                
+                if (isAttacking) {
+                   mesh.current.position.x = -0.1;
+                   mesh.current.position.y = 0.1;
+                   mesh.current.rotation.z = -Math.PI / 4;
+                } else {
+                   mesh.current.rotation.z = THREE.MathUtils.lerp(mesh.current.rotation.z, 0, 0.2);
+                }
+            });
+
+            return (
+                <group ref={mesh}>
+                    <mesh position={[0.5, -0.4, -1]}>
+                        <planeGeometry args={[0.8, 0.8]} />
+                        <meshBasicMaterial 
+                            map={new THREE.TextureLoader().load('https://i.imgur.com/NHng3Sw.png')} 
+                            transparent={true} 
+                            depthTest={false}
+                        />
+                    </mesh>
+                </group>
+            );
+        };
+
+        const PlayerController = ({ onAttack, position = [0, 2, 10] }) => {
+            const { camera } = useThree();
+            const velocity = useRef(new THREE.Vector3());
+            const move = { forward: false, backward: false, left: false, right: false };
+
+            useEffect(() => {
+                const handleKey = (e, val) => {
+                    if (e.key === 'w') move.forward = val;
+                    if (e.key === 's') move.backward = val;
+                    if (e.key === 'a') move.left = val;
+                    if (e.key === 'd') move.right = val;
+                };
+                window.addEventListener('keydown', (e) => handleKey(e, true));
+                window.addEventListener('keyup', (e) => handleKey(e, false));
+                window.addEventListener('mousedown', onAttack);
+                return () => {
+                    window.removeEventListener('keydown', (e) => handleKey(e, true));
+                    window.removeEventListener('keyup', (e) => handleKey(e, false));
+                    window.removeEventListener('mousedown', onAttack);
+                };
+            }, [onAttack]);
+
+            useFrame((state, delta) => {
+                const speed = 15;
+                const direction = new THREE.Vector3();
+                const frontVector = new THREE.Vector3(0, 0, Number(move.backward) - Number(move.forward));
+                const sideVector = new THREE.Vector3(Number(move.left) - Number(move.right), 0, 0);
+
+                direction.subVectors(frontVector, sideVector).normalize().multiplyScalar(speed).applyEuler(camera.rotation);
+                velocity.current.set(direction.x, 0, direction.z);
+                camera.position.addScaledVector(velocity.current, delta);
+                
+                // Simple boundary collision
+                camera.position.y = 1.7; 
+                if (Math.abs(camera.position.x) > 14) camera.position.x = Math.sign(camera.position.x) * 14;
+                if (Math.abs(camera.position.z) > 14) camera.position.z = Math.sign(camera.position.z) * 14;
+            });
+
+            return <PointerLockControls />;
+        };
+
+        const TestChamber = ({ cascadeActive }) => {
+            const rotor = useRef();
+            useFrame((state) => {
+                if (rotor.current) {
+                    rotor.current.rotation.y += cascadeActive ? 0.5 : 0.05;
+                    if (cascadeActive) {
+                        rotor.current.position.y = 5 + Math.sin(state.clock.elapsedTime * 20) * 0.1;
+                    }
+                }
+            });
+
+            return (
+                <group>
+                    {/* Room */}
+                    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]}>
+                        <planeGeometry args={[30, 30]} />
+                        <meshStandardMaterial map={GlobalTextures.concrete} />
+                    </mesh>
+                    <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, 10, 0]}>
+                        <planeGeometry args={[30, 30]} />
+                        <meshStandardMaterial map={GlobalTextures.concrete} />
+                    </mesh>
+                    {/* Walls */}
+                    { [0, 1, 2, 3].map(i => (
+                        <mesh key={i} rotation={[0, (i * Math.PI) / 2, 0]} position={[Math.sin(i * Math.PI / 2) * -15, 5, Math.cos(i * Math.PI / 2) * -15]}>
+                            <planeGeometry args={[30, 10]} />
+                            <meshStandardMaterial map={GlobalTextures.labwall} />
+                        </mesh>
+                    ))}
+
+                    {/* The Machine */}
+                    <group position={[0, 0, 0]} ref={rotor}>
+                        <mesh position={[0, 2, 0]}>
+                            <torusGeometry args={[3, 0.4, 8, 24]} />
+                            <meshStandardMaterial map={GlobalTextures.metal} />
+                        </mesh>
+                        <mesh position={[0, 5, 0]}>
+                            <cylinderGeometry args={[0.5, 0.5, 10]} />
+                            <meshStandardMaterial map={GlobalTextures.hazard} />
+                        </mesh>
+                    </group>
+
+                    {cascadeActive && (
+                        <pointLight position={[0, 5, 0]} color="#00ff00" intensity={50} distance={20} />
+                    )}
+                </group>
+            );
+        };
+
+        // --- 3. UI SCREENS ---
+
+        const MainMenu = ({ onStart }) => (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-cover bg-center" 
+                 style={{backgroundImage: 'url("https://images.alphacoders.com/544/thumb-1920-544525.jpg")', filter: 'brightness(0.8) contrast(1.2)'}}>
+                <div className="bg-black/60 p-12 border-l-4 border-[#ffb000]">
+                    <h1 className="text-8xl font-black text-[#ffb000] tracking-tighter mb-8 flex items-center">
+                        H<span className="mx-2">A</span>LF-L<span className="relative">I<span className="absolute -top-4 -left-12 opacity-20 text-9xl">λ</span></span>FE
+                    </h1>
+                    <div className="flex flex-col gap-4 text-2xl">
+                        {['New Game', 'Hazard Course', 'Configuration', 'Quit'].map(item => (
+                            <button key={item} onClick={() => item === 'New Game' && onStart()} 
+                                    className="text-left hover:text-[#ffb000] transition-colors text-white uppercase tracking-widest">
+                                {item}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+
+        const LoadingScreen = ({ onFinish }) => {
+            const [logs, setLogs] = useState([]);
+            useEffect(() => {
+                const messages = [
+                    "Initializing video subsystem...",
+                    "Checking CD-ROM...",
+                    "Loading valve/dlls/hl.dll",
+                    "Parsing test_chamber.bsp",
+                    "Pre-caching materials...",
+                    "Establishing connection to Black Mesa..."
+                ];
+                let i = 0;
+                const interval = setInterval(() => {
+                    setLogs(prev => [...prev, messages[i]]);
+                    i++;
+                    if (i >= messages.length) {
+                        clearInterval(interval);
+                        setTimeout(onFinish, 1000);
+                    }
+                }, 400);
+            }, []);
+
+            return (
+                <div className="absolute inset-0 z-30 bg-black p-20 flex flex-col justify-between">
+                    <div className="text-green-500 font-mono text-xl space-y-1">
+                        {logs.map((log, idx) => <div key={idx}>> {log}</div>)}
+                    </div>
+                    <div className="w-full h-4 border border-[#ffb000] p-1">
+                        <div className="h-full hl-bg-orange w-3/4 animate-pulse"></div>
+                    </div>
+                </div>
+            );
+        };
+
+        const HUD = ({ health, suit, ammo }) => (
+            <div className="absolute inset-0 pointer-events-none flex flex-col justify-end p-8 z-10">
+                <div className="flex justify-between items-end">
+                    <div className="flex gap-12 hl-orange text-5xl items-center bg-black/30 p-4 px-8 rounded">
+                        <div className="flex items-center gap-4">
+                            <span className="text-2xl">✚</span> {health}
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <span className="text-2xl">🛡</span> {suit}
+                        </div>
+                    </div>
+                    <div className="hl-orange text-6xl bg-black/30 p-4 px-10 rounded">
+                        {ammo}
+                    </div>
+                </div>
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-[#ffb000] opacity-40 text-4xl font-light">
+                    [ &nbsp; ]
+                </div>
+            </div>
+        );
+
+        // --- 4. MAIN APP ---
+
+        const App = () => {
+            const [gameState, setGameState] = useState('MENU');
+            const [cascade, setCascade] = useState(false);
+            const [attacking, setAttacking] = useState(false);
+            const [health, setHealth] = useState(100);
+
+            const handleAttack = useCallback(() => {
+                setAttacking(true);
+                setTimeout(() => setAttacking(false), 200);
+            }, []);
+
+            useEffect(() => {
+                if (gameState === 'PLAYING') {
+                    const timer = setTimeout(() => {
+                        setCascade(true);
+                    }, 10000);
+                    return () => clearTimeout(timer);
+                }
+            }, [gameState]);
+
+            return (
+                <div className="w-full h-full relative">
+                    {gameState === 'MENU' && <MainMenu onStart={() => setGameState('LOADING')} />}
+                    {gameState === 'LOADING' && <LoadingScreen onFinish={() => setGameState('PLAYING')} />}
+                    
+                    {gameState === 'PLAYING' && (
+                        <>
+                            <HUD health={health} suit={15} ammo={0} />
+                            <Canvas shadows camera={{ fov: 75, near: 0.1, far: 1000 }}>
+                                <ambientLight intensity={cascade ? 0.2 : 0.5} />
+                                <fog attach="fog" args={['#000', 5, 25]} />
+                                
+                                <TestChamber cascadeActive={cascade} />
+                                <PlayerController onAttack={handleAttack} />
+                                
+                                <PerspectiveCamera makeDefault position={[0, 1.7, 10]} />
+                                <Weapon isAttacking={attacking} />
+
+                                {cascade && <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />}
+                            </Canvas>
+                        </>
+                    )}
+
+                    {/* Damage Flash */}
+                    <div className={`absolute inset-0 bg-red-600/30 pointer-events-none transition-opacity duration-300 ${attacking ? 'opacity-0' : 'opacity-0'}`} />
+                </div>
+            );
+        };
+
+        createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
